@@ -343,6 +343,7 @@ class AgroManagementDataProvider(list):
         except yaml.YAMLError as e:
             msg = "Failed parsing agromanagement string %s: %s" % (input, e)
             raise exc.PCSEError(msg)
+        del self[:]
         self.extend(items)
 
     def set_campaign_start_date(self, start_date):
@@ -358,7 +359,7 @@ class AgroManagementDataProvider(list):
     def __str__(self):
         msg1 = ("Agromanagement data for crop_no=%i (%s) derived from: %s" %
                (self.crop_no, self.crop_name, self.db_resource))
-        msg2 = self._build_yaml_agromanagement()
+        msg2 = "%s" % self
         msg = "  %s:\n %s" % (msg1, msg2)
         return msg
 
