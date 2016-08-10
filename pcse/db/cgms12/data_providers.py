@@ -558,16 +558,17 @@ class CropDataProvider(dict):
                               "LAIEM", "PERDL", "Q10", "RDI", "RDMCR", "RGRLAI",
                               "RML", "RMO", "RMR", "RMS", "RRI", "SPA", "SPAN", "SSA",
                               "TBASE", "TBASEM", "TDWI", "TEFFMX", "TSUM1", "TSUM2",
-                              "TSUMEM")
+                              "TSUMEM", "VERNBASE", "VERNSAT", "VERNDVS")
     parameter_codes_tabular = ("AMAXTB", "DTSMTB", "FLTB", "FOTB", "FRTB", "FSTB",
                                "RDRRTB", "RDRSTB", "RFSETB", "SLATB", "TMNFTB",
-                               "TMPFTB")
+                               "TMPFTB", "VERNRTB")
     # Some parameters have to be converted from a single to a tabular form
     single2tabular = {"SSA": ("SSATB", [0., None, 2.0, None]),
                       "KDIF": ("KDIFTB", [0., None, 2.0, None]),
                       "EFF": ("EFFTB", [0., None, 40., None])}
     # Default values for additional parameters not defined in CGMS
     parameters_additional = {"DVSI": 0.0, "IOX": 0}
+    parameters_optional = ["VERNRTB", "VERNBASE", "VERNSAT", "VERNDVS"]
 
     def __init__(self, engine, grid_no, crop_no, campaign_year):
         dict.__init__(self)
@@ -613,6 +614,7 @@ class CropDataProvider(dict):
                             table_crop_pv.c.parameter_code == parameter_code)).execute()
             row = r.fetchone()
             if row is None:
+                if parameter_code in parameters_optional: continue
                 msg = "No parameter value found for crop_no=%s, parameter_code='%s'."
                 raise exc.PCSEError(msg % (self.crop_no, parameter_code))
             if parameter_code not in self.single2tabular:
@@ -631,6 +633,7 @@ class CropDataProvider(dict):
                        order_by=[table_crop_pv.c.parameter_code]).execute()
             rows = r.fetchall()
             if not rows:
+                if parameter_code in parameters_optional: continue
                 msg = "No parameter value found for crop_no=%s, parameter_code='%s'."
                 raise exc.PCSEError(msg % (self.crop_no, parameter_code))
             if len(rows) == 1:
