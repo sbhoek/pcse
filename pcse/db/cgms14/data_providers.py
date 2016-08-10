@@ -477,15 +477,16 @@ class CropDataProvider(dict):
                               "DLO", "DVSEND", "EFF", "IAIRDU", "IDSL", "KDIF", "LAIEM", "PERDL",
                               "Q10", "RDI", "RDMCR", "RGRLAI", "RML", "RMO", "RMR", "RMS", "RRI",
                               "SPA", "SPAN", "SSA", "TBASE", "TBASEM", "TDWI", "TEFFMX", "TSUM1",
-                              "TSUM2", "TSUMEM")
+                              "TSUM2", "TSUMEM", "VERNBASE", "VERNSAT", "VERNDVS")
     parameter_codes_tabular = ("AMAXTB", "DTSMTB", "FLTB", "FOTB", "FRTB", "FSTB",
-                               "RDRRTB", "RDRSTB", "RFSETB", "SLATB", "TMNFTB", "TMPFTB")
+                               "RDRRTB", "RDRSTB", "RFSETB", "SLATB", "TMNFTB", "TMPFTB", "VERNRTB")
     # Some parameters have to be converted from a single to a tabular form
     single2tabular = {"SSA": ("SSATB", [0., None, 2.0, None]),
                       "KDIF": ("KDIFTB", [0., None, 2.0, None]),
                       "EFF": ("EFFTB", [0., None, 40., None])}
     # Default values for additional parameters not defined in CGMS
     parameters_additional = {"DVSI": 0.0, "IOX": 0}
+    parameters_optional = ["VERNRTB", "VERNBASE", "VERNSAT", "VERNDVS"]
 
     def __init__(self, engine, idgrid, idcrop_parametrization):
         dict.__init__(self)
@@ -554,6 +555,7 @@ class CropDataProvider(dict):
                 for key in self:
                     if key.startswith(parameter_code): found = True; break
             if not found:
+                if parameter_code in parameters_optional: continue
                 msg = ("No parameter value found for idcrop_parametrization=%s, "
                        "parameter_code='%s'." % (self.idcrop_parametrization, parameter_code))
                 raise exc.PCSEError(msg)
@@ -570,6 +572,7 @@ class CropDataProvider(dict):
             rows = sc.fetchall()
             sc.close()
             if not rows:
+                if crop_parameter in parameters_optional: continue
                 msg = ("No parameter value found for "
                        "idcrop_parametrization=%s, crop_parameter='%s'.")
                 raise exc.PCSEError(msg % (self.idcrop_parameterization, crop_parameter))
