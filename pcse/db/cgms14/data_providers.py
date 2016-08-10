@@ -555,7 +555,7 @@ class CropDataProvider(dict):
                 for key in self:
                     if key.startswith(parameter_code): found = True; break
             if not found:
-                if parameter_code in parameters_optional: continue
+                if parameter_code in self.parameters_optional: continue
                 msg = ("No parameter value found for idcrop_parametrization=%s, "
                        "parameter_code='%s'." % (self.idcrop_parametrization, parameter_code))
                 raise exc.PCSEError(msg)
@@ -572,7 +572,7 @@ class CropDataProvider(dict):
             rows = sc.fetchall()
             sc.close()
             if not rows:
-                if crop_parameter in parameters_optional: continue
+                if crop_parameter in self.parameters_optional: continue
                 msg = ("No parameter value found for "
                        "idcrop_parametrization=%s, crop_parameter='%s'.")
                 raise exc.PCSEError(msg % (self.idcrop_parameterization, crop_parameter))
