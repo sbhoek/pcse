@@ -86,11 +86,11 @@ class NetcdfWeatherDataProvider(WeatherDataProvider, ge.GridEnvelope2D):
     __fp_txt_fname = ""
     NetcdfDatasets = {} 
     available_years = []
-    _elevation = None
 
-    # Latitude and longitude - initialise for Tema, Ghana
+    # Latitude, longitude and elevation - initialise for Tema, Ghana
     _lat = 5.65
     _lon = 0.0
+    elevation = 1
     
     # First and last year - just initialise for the zeros
     _firstyear = 2000
@@ -106,41 +106,53 @@ class NetcdfWeatherDataProvider(WeatherDataProvider, ge.GridEnvelope2D):
         self._missing_snow_depth = missing_snow_depth
         self.__file_pattern = fn_pattern
 
+        # Do some logging
         msg = "About to retrieve weather data from Netcdf files for lat/lon: (%f, %f)."
         self.logger.info(msg % (self._lat, self._lon))
 
-        # Construct search path etc.
+        # Construct search path, search the files and store the names in a text file
         search_path = self._construct_search_path(nc_path)
         nc_files = self.__scan_nc_files(search_path)
-        
-        # Let's use a text file to represent the dataset
         self.__fp_txt_fname = os.path.join(search_path, "vars" + fn_pattern + "txt")
         if not os.path.exists(self.__fp_txt_fname):
             with open(self.__fp_txt_fname, 'w') as f:
                 for fname in nc_files:
                     f.write(os.path.basename(fname) + "\n")
-                    
-        # Decide to read the NetCDF files or to load the data from cache
-        if force_reload or not self._load_cache_file(self.__fp_txt_fname):
-            # TODO: activate caching mechanism 
-            pass
         
-        # Of the required files, find out which are available 
-        self.NetcdfDatasets, self.available_years = self.__open_nc_files(nc_files)
+        # Get the relevant dates
+        datestrings = self._get_date_strings(nc_files[0], fn_pattern)
+        cache_fname = os.path.join(fn_pattern[1:] + "-".join(datestrings) + ".cache")
+        if force_reload or not self._load_cache_file(cache_fname):
+            # No cache file found, so start loading. Of the required files, find out which are available 
+            self.NetcdfDatasets, self.available_years = self.__open_nc_files(nc_files)
+                
+            # Read attributes, assign them to the envelope and calculate the nearest point
+            self.__read_attributes()
+            ge.GridEnvelope2D.__init__(self, self.ncols, self.nrows, self.xll, self.yll, self._dx, self._dy)
+            self.longitude, self.latitude = self.getNearestCenterPoint(longitude, latitude)
             
-        # Read attributes, assign them to the envelope and calculate the nearest point
-        self.__read_attributes()
-        ge.GridEnvelope2D.__init__(self, self.ncols, self.nrows, self.xll, self.yll, self._dx, self._dy)
-        self.longitude, self.latitude = self.getNearestCenterPoint(longitude, latitude)
-        
-        # Retrieve the records for this location and store them
-        self._elevation = self._get_elevation(search_path, longitude, latitude)
-        self._process_netcdf(search_path) 
+            # Retrieve the records for this location and store them
+            self.elevation = self._get_elevation(search_path, longitude, latitude)
+            self._process_netcdf(search_path)
+            
+            # Make sure a cache file is available next time
+            cache_filename = self._get_cache_filename(cache_fname)
+            self._dump(cache_filename)
 
+    def _get_date_strings(self, nc_file, fn_pattern):
+        result  = []
+        nc_stem = os.path.splitext(os.path.basename(nc_file))[0]
+        pos = str.find(nc_stem, "_")
+        if pos != -1:
+            datepart = nc_stem[pos + len(fn_pattern):]
+            result = datepart.split("-")
+        return result
+    
     def _get_elevation(self, search_path, longitude, latitude):
         # Open the elevation grid - it probably has a different extent than the NetCDF rasters
         result = None
         try:
+            # Assume a folder "geodata" with the same parent as the folder with meteo data
             path2geodata = os.path.dirname(os.path.dirname(search_path))
             path2gridfile = os.path.join(path2geodata, "geodata", "Europe", "elev_pt1_deg_grid.asc")
             elevation_grid = ag.AsciiGrid(path2gridfile)
@@ -266,7 +278,7 @@ class NetcdfWeatherDataProvider(WeatherDataProvider, ge.GridEnvelope2D):
             ncda = ncds.data_vars[varname]
             series = ncda.sel(rlon=self.longitude, rlat=self.latitude, method='nearest').to_series()
             assert len(series) == self._timesteps, "Time steps for variable %s are not right!" % varname
-            vap_values = vap_from_sh(series.values, self._elevation)
+            vap_values = vap_from_sh(series.values, self.elevation)
             df = df.assign(vap=vap_values)
 
             #self.description = "Meteo data from HDF5 file " + f.filename
@@ -281,23 +293,22 @@ class NetcdfWeatherDataProvider(WeatherDataProvider, ge.GridEnvelope2D):
     def _make_WeatherDataContainers(self, df):
         # Prepare to loop over all the rows derived from the table
         for i, row in df.iterrows():
-            t = {"LAT": self.latitude, "LON": self.longitude, "ELEV": self._elevation}
-            t["DAY"] = row["time"].to_pydatetime()
-            t.update(zip(list(row.index)[1:], row.values[1:]))
+            t = {"LAT": self.latitude, "LON": self.longitude, "ELEV": self.elevation}
+            t["DAY"] = row["time"].to_pydatetime().date()
+            mapping = {v: (k, f, u) for k, v, f, u in (self.pcse_variables + [("VAP", "vap", kPa_to_hPa, "hPa")])}
+            varlist = [mapping[var] for var in list(row.index)[1:]]
+            values = row.values[1:]
+            for i, (ucname, conversion, unit) in enumerate(varlist):
+                if conversion is not None: t[ucname] = conversion(values[i])
+                else: t[ucname] = values[i]
+
+            # Add calculation of E0, ES0 and ET0. Reference ET returns values in mm/day - convert to cm/day
+            args = (t["DAY"], t["LAT"], t["ELEV"], t["TMIN"], t["TMAX"], t["IRRAD"], t["VAP"], t["WIND"])
+            e0, es0, et0 = reference_ET(*args, ANGSTA=self.angstA, ANGSTB=self.angstB)
+            t.update({"E0": e0 / 10., "ES0": es0 / 10., "ET0": et0 / 10.})
 
             # Build weather data container from dict 't'
             wdc = WeatherDataContainer(**t)
-
-            # TODO: add calculation of E0, ES0 and ET0
-            '''
-            # Reference ET in mm/day
-            e0, es0, et0 = reference_ET(LAT=self.latitude, ELEV=self.elevation, ANGSTA=self.angstA,
-                                            ANGSTB=self.angstB, **d)
-            # convert to cm/day
-            wdc["E0"] = e0/10.
-            wdc["ES0"] = es0/10.
-            wdc["ET0"] = et0/10.
-            '''
 
             # add wdc to dictionary for this date
             self._store_WeatherDataContainer(wdc, wdc.DAY)
@@ -308,11 +319,11 @@ class NetcdfWeatherDataProvider(WeatherDataProvider, ge.GridEnvelope2D):
             # The data are stored with a tuple as key: (date, 0)
             if not (date(yr, 2, 29),0) in self.store:
                 # Copy the data for the 28th to the 29th
-                data = self.store[(date(yr, 2, 28),0)]
-                self.store[(date(yr, 2, 29),0)] = data
+                data = self.store[(date(yr, 2, 28), 0)]
+                self.store[(date(yr, 2, 29), 0)] = data
 
-    def _load_cache_file(self, dataset_fname):
-        cache_filename = self._find_cache_file(dataset_fname)
+    def _load_cache_file(self, cache_fname):
+        cache_filename = self._find_cache_file(cache_fname)
         if cache_filename is None:
             return False
         else:
@@ -322,20 +333,39 @@ class NetcdfWeatherDataProvider(WeatherDataProvider, ge.GridEnvelope2D):
             except:
                 return False
 
-    def _find_cache_file(self, dataset_fname):
+    def _find_cache_file(self, cache_fname):
         """Try to find a cache file for file name
-
         Returns None if the cache file does not exist, else it returns the full path
         to the cache file.
         """
-        cache_filename = self._get_cache_filename(dataset_fname)
+        result = None
+        cache_filename = self._get_cache_filename(cache_fname)
         if os.path.exists(cache_filename):
             cache_date = os.stat(cache_filename).st_mtime
-            xls_date = os.stat(dataset_fname).st_mtime
-            if cache_date > xls_date:  # cache is more recent then XLS file
-                return cache_filename
+        else:
+            return result
 
-        return None
+        try:
+            if os.path.exists(self.__fp_txt_fname):
+                search_path = os.path.dirname(self.__fp_txt_fname)
+                with open(self.__fp_txt_fname, 'r') as f:
+                    newer_file_found = False
+                    for fname in f:
+                        nc_file = os.path.join(search_path, fname.strip())
+                        if os.path.exists(nc_file):
+                            nc_date = os.stat(nc_file).st_mtime
+                            if cache_date < nc_date:
+                                # cache is less recent than NetCDF file
+                                newer_file_found = True
+                                break
+                        else:
+                            raise IOError("File %s was not found!" % fname)
+                    
+                    # Okay, we looped over all the NetCDF files
+                    if not newer_file_found:
+                        result = cache_filename
+        finally:
+            return result
 
     def _get_cache_filename(self, dataset_fname):
         """Constructs the filename used for cache files given dataset_name
