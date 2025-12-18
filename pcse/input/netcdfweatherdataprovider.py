@@ -9,7 +9,7 @@ import glob
 import xarray as xr
 from math import exp, pow
 import numpy as np
-from datetime import datetime, date
+from datetime import datetime as dt, date
 import time
 import pandas as pd
 from calendar import isleap
@@ -21,7 +21,7 @@ from pcse.base import WeatherDataContainer, WeatherDataProvider
 from pcse.util import reference_ET, angstrom, check_angstromAB
 from pcse.exceptions import PCSEError
 from pcse.settings import settings
-from pickle import NONE
+from typing import List, Tuple
 
 # Conversion functions
 no_conv = lambda x: x
@@ -81,12 +81,12 @@ class NetcdfWeatherDataProvider(WeatherDataProvider, ge.GridEnvelope2D):
     angstB = 0.5
     _ETmodel = "PM"
     _missing_snow_depth = None
-    __date_pattern = "20??0101-20??1231"
+    __date_patterns = ["19??0101-19??1231", "19??0101-20??1231", "20??0101-20??1231"]
 
     # Dictionaries, lists etc. to store relevant stuff
     __file_pattern = ""
     __fp_txt_fname = ""
-    NetcdfDatasets = {} 
+    NetcdfDataset = None
     available_years = []
 
     # Latitude, longitude and elevation - initialise for Tema, Ghana
@@ -117,16 +117,21 @@ class NetcdfWeatherDataProvider(WeatherDataProvider, ge.GridEnvelope2D):
         nc_files = self.__scan_nc_files(search_path)
         self.__fp_txt_fname = os.path.join(search_path, "vars" + fn_pattern + "txt")
         if not os.path.exists(self.__fp_txt_fname):
-            with open(self.__fp_txt_fname, 'w') as f:
-                for fname in nc_files:
-                    f.write(os.path.basename(fname) + "\n")
-        
+            # Create the text file anew
+            self.__write_filenames(nc_files)
+        else:
+            # Check at least whether the number of files is still the same
+            tmplist = self.__read_filenames()
+            if len(tmplist) != len(nc_files):
+                # Otherwise update the file!
+                self.__write_filenames(nc_files)    
+
         # Get the relevant dates
-        datestrings = self._get_date_strings(nc_files[0], fn_pattern)
+        datestrings = self._get_date_strings(nc_files, fn_pattern)
         cache_fname = os.path.join(fn_pattern[1:] + "-".join(datestrings) + ".cache")
         if force_reload or not self._load_cache_file(cache_fname):
             # No cache file found, so start loading. Of the required files, find out which are available 
-            self.NetcdfDatasets, self.available_years = self.__open_nc_files(nc_files)
+            self.NetcdfDataset, self.available_years = self.__open_nc_files(nc_files)
                 
             # Read attributes, assign them to the envelope and calculate the nearest point
             self.__read_attributes()
@@ -140,15 +145,53 @@ class NetcdfWeatherDataProvider(WeatherDataProvider, ge.GridEnvelope2D):
             # Make sure a cache file is available next time
             cache_filename = self._get_cache_filename(cache_fname)
             self._dump(cache_filename)
+    
+    def __write_filenames(self, nc_files):
+        with open(self.__fp_txt_fname, 'w') as f:
+            f.write(str(self._lon) + "," + str(self._lat) + "\n")
+            for fname in nc_files:
+                f.write(os.path.basename(fname) + "\n")
+    
+    def __read_filenames(self):
+        # Initialise
+        result = []
+        
+        # Loop over the lines in the file object
+        with open(self.__fp_txt_fname, 'r') as f:
+            for line in f:
+                fname = line.strip('\n')
+                result.append(fname)
+                
+        # Return the names but not the first line
+        return result[1:]
 
-    def _get_date_strings(self, nc_file, fn_pattern):
-        result  = []
-        nc_stem = os.path.splitext(os.path.basename(nc_file))[0]
-        pos = str.find(nc_stem, "_")
-        if pos != -1:
-            datepart = nc_stem[pos + len(fn_pattern):]
-            result = datepart.split("-")
-        return result
+    def _get_date_strings(self, nc_files, fn_pattern) -> str:
+        # Initialise
+        start_dates, end_dates = [], []
+        result = "19800101-20251231"
+        
+        try:
+            # Loop over the filenames and find dates
+            for fname in nc_files:
+                nc_stem = os.path.splitext(os.path.basename(fname))[0]
+                pos = str.find(nc_stem, "_")
+                if pos != -1:
+                    start_date, end_date = nc_stem[pos + len(fn_pattern):].split("-")
+                    if not start_date in start_dates: start_dates.append(start_date)
+                    if not end_date in end_dates: end_dates.append(end_date)
+                    
+            # Get the earliest start date and the latest end date
+            if len(start_dates) == 0 or len(end_dates) == 0:
+                errmsg = "No Netcdf4 files found with dates in the name in folder %s"
+                raise PCSEError(errmsg % os.path.dirname(nc_files[0]))
+            start_dates = [dt.strptime(ds, '%Y%m%d').date() for ds in start_dates]
+            end_dates = [dt.strptime(ds, '%Y%m%d').date() for ds in end_dates]
+            result = (min(start_dates).strftime("%Y%m%d"), max(end_dates).strftime("%Y%m%d"))
+        except Exception as e:
+            warn(e)
+            warn("Unable to derive start and end date from the file names!")
+        finally:
+            return result
     
     def _get_elevation(self, search_path, longitude, latitude):
         # Open the elevation grid - it probably has a different extent than the NetCDF rasters
@@ -190,46 +233,53 @@ class NetcdfWeatherDataProvider(WeatherDataProvider, ge.GridEnvelope2D):
             p = os.path.join(os.getcwd(), fpath)
         return os.path.normpath(p)
     
-    def __scan_nc_files(self, search_path): 
+    def __scan_nc_files(self, search_path):
+        # Initialise
+        result = []
+        
         # Find all Netcdf files on given path with given pattern
         # Also sorts the list, checks for missing years and sets self.lastyear
-        # Assume this pattern: [variable_name]_[fn_pattern]_[20??]0101-20??1231.[nc]
+        # Assume this pattern: [variable_name]_[fn_pattern]_[????0101-????1231].[nc]
         if not search_path.endswith(os.path.sep): search_path += os.path.sep
-        result = sorted(glob.glob(search_path + "*" + self.__file_pattern + self.__date_pattern + ".nc"))
+        for date_pattern in self.__date_patterns:
+            result += glob.glob(search_path + "*" + self.__file_pattern + date_pattern + ".nc")
+        result = sorted(result)
         if len(result) == 0:
             raise PCSEError("No Netcdf4 files found when searching at %s" % search_path)
         return result
 
-    def __open_nc_files(self, nc_files):
-        # Loop over the files in the list nc_files, open them and keep a refrence
-        key_ds_dict = {}
-        for ncfile in nc_files:
+    def __open_nc_files(self, nc_files) -> xr.Dataset:
+        # Loop over the files in the list nc_files
+        mfds = None
+        tmplist = []
+        for nc_file in nc_files:
             # Check that we need this ncfile in the first place
-            fn = os.path.basename(ncfile)
+            fn = os.path.basename(nc_file)
             pos = fn.find('_'); # it is assumed that the first part indicates the variable
             varname = fn[0:pos]
             if (varname in self.netcdf_variables):
                 # Ok, the ncfile contains data wrt. one of the relevant variables
-                try:
-                    ncds = xr.open_dataset(
-                        ncfile, 
-                        engine="h5netcdf", 
-                        decode_cf=True,       # CF-compliant decoding (default True)
-                        mask_and_scale=True,  # Apply _FillValue and scale factors
-                        decode_times=True,    # Convert time units to datetime objects
-                        chunks={"time": 365}
-                    )
-                except Exception as e:
-                    print(e)
-                    raise PCSEError("An error occurred while opening file " + fn)
-                key_ds_dict[varname] = ncds
-        
-        # Assume that we can retrieve the first and last year from the variable ncfile 
-        timestr = ncfile[-20:-3]
-        dt_0, dt_n = timestr.split("-")
-        yr_0, yr_n = datetime.strptime(dt_0, "%Y%m%d").year, datetime.strptime(dt_n, "%Y%m%d").year 
-        self.available_years = list(range(yr_0, yr_n + 1))
-        return key_ds_dict, self.available_years
+                tmplist.append(nc_file)
+                
+            # Assume that we can retrieve the first and last year from the variable nc_file 
+            lenext = len(os.path.splitext(fn)[1])
+            (dtstr_0, dtstr_n) = nc_file[(-17 - lenext):-1 * lenext].split("-")
+            (dt_0, dt_n) = (dt.strptime(dtstr_0, "%Y%m%d"), dt.strptime(dtstr_n, "%Y%m%d"))
+            self.available_years = list(range(dt_0.year, dt_n.year + 1))
+                
+        try:
+            mfds = xr.open_mfdataset(
+                nc_files, 
+                data_vars=None, 
+                coords='all', 
+                compat='override',
+                combine='by_coords' 
+            )
+        except Exception as e:
+            print(e)
+            raise PCSEError("An error occurred while opening the Netcdf files.")
+
+        return mfds, self.available_years
 
     def __get_lon_values(self, ds):
         return ds.lon.values
@@ -241,30 +291,31 @@ class NetcdfWeatherDataProvider(WeatherDataProvider, ge.GridEnvelope2D):
         result = False
         try:
             # Get the name and instance of the first xarray DataSet
-            varname = next(iter(self.NetcdfDatasets.keys()))
-            firstds = self.NetcdfDatasets[varname]
-            
-            # Get the attributes wrt. the georeference
-            shp = firstds.data_vars[varname].shape
-            self.ncols = shp[2]
-            self.nrows = shp[1]
+            keylist = list(self.NetcdfDataset.keys())
+            lastds = self.NetcdfDataset[keylist[-1]]
             
             # Assume they have used a so-called rotated pole
             infomsg = "Problem: the NetCDF file does not contain a rotated pole as was assumed"
-            assert "rotated_pole" in firstds.variables, infomsg
-            lon_values = self.__get_lon_values(firstds)
-            lat_values = self.__get_lat_values(firstds)
-            self.xll = lon_values[0, 0]
-            self.yll = lat_values[0, 0]
-            self._dx = lon_values[0, 1] - self.xll
-            self._dy = lat_values[1, 0] - self.yll
+            assert "rotated_pole" in keylist, infomsg
+            
+            # Get the attributes wrt. the georeference
+            shp = lastds.shape
+            assert len(shp) == 3, "Unexpected shape found for DataArray " + lastds.name
+            self.ncols = shp[2]
+            self.nrows = shp[1]
+            lon_values = self.__get_lon_values(lastds)
+            lat_values = self.__get_lat_values(lastds)
+            self.xll = lon_values[0, 0, 0]
+            self.yll = lat_values[0, 0, 0]
+            self._dx = lon_values[0, 0, 1] - self.xll
+            self._dy = lat_values[0, 1, 0] - self.yll
             self.NODATA_value = np.nan
             
             # Get the attributes wrt. temporal reference
             # Suppress the warnings generated by the call to method to_datetimeindex
             curlineno = _getframe().f_lineno
             simplefilter('ignore', lineno=curlineno+2)
-            datetimeindex = firstds.indexes['time'].to_datetimeindex()
+            datetimeindex = lastds.indexes['time'].to_datetimeindex()
             self._firstyear = datetimeindex[0].date().year
             self._lastyear  = datetimeindex[-1].date().year
             self._timesteps = len(datetimeindex)
@@ -274,26 +325,26 @@ class NetcdfWeatherDataProvider(WeatherDataProvider, ge.GridEnvelope2D):
     
     # Todo: adapt !!!   
     def _process_netcdf(self, search_path):
-        if len(self.NetcdfDatasets) == len(self.netcdf_variables):
+        # At this point netcdf_variables is not yet including huss, rotated pole and time_bnds
+        if len(self.NetcdfDataset.data_vars) - 3 == len(self.netcdf_variables):
             # Prepare to time the data extraction
             t1 = time.time()
             
             # Find out more about the target point
-            varname = next(iter(self.NetcdfDatasets.keys()))
-            firstds = self.NetcdfDatasets[varname]
-            lon_vals = self.__get_lon_values(firstds)
-            lat_vals = self.__get_lat_values(firstds)
-            dist = np.sqrt((lon_vals - self.longitude)**2 + (lat_vals - self.latitude)**2)
+            keylist = list(self.NetcdfDataset.keys())
+            lastds = self.NetcdfDataset[keylist[-1]]
+            lon_vals = self.__get_lon_values(lastds)
+            lat_vals = self.__get_lat_values(lastds)
+            dist = np.sqrt((lon_vals[0] - self.longitude)**2 + (lat_vals[0] - self.latitude)**2)
             i, k = np.unravel_index(np.argmin(dist), dist.shape)
             if DEBUG_LEVEL > 0:
-                print("About to extract values for (%.2f, %.2f)" % (lon_vals[i,k], lat_vals[i,k])) 
+                print("About to extract values for (%.2f, %.2f)" % (lon_vals[0,i,k], lat_vals[0,i,k])) 
 
             # Loop over the variables
             df = pd.DataFrame()
             for j, varname in enumerate(self.netcdf_variables):
                 # Get the DataArray relevant for the variable
-                ncds = self.NetcdfDatasets[varname]
-                ncda = ncds.data_vars[varname]
+                ncda = self.NetcdfDataset[varname]
                 
                 # Retrieve the value of the pixel nearest to the given latitude and longitude
                 series = ncda[:, i, k].to_series()
@@ -305,21 +356,34 @@ class NetcdfWeatherDataProvider(WeatherDataProvider, ge.GridEnvelope2D):
 
             # Assign some extra attributes - what if value == nodata_value?
             varname = "huss"
+            tmpnc_files = []
             if not search_path.endswith(os.path.sep): search_path += os.path.sep
-            tmpnc_files = sorted(glob.glob(search_path + varname + self.__file_pattern + self.__date_pattern +".nc"))
-            assert len(tmpnc_files) == 1, "Netcdf4 file not found when searching at %s" % search_path
-            try:
-                ncds = xr.open_dataset(tmpnc_files[0], 
-                    engine="h5netcdf", 
-                    decode_cf=True,       # CF-compliant decoding (default True)
-                    mask_and_scale=True,  # Apply _FillValue and scale factors
-                    decode_times=True,    # Convert time units to datetime objects
-                    chunks={"time": 365}
+            for date_pattern in self.__date_patterns:
+                tmplist = sorted(glob.glob(search_path + varname + self.__file_pattern + date_pattern +".nc"))
+                tmpnc_files = tmpnc_files + tmplist
+            assert len(tmpnc_files) >= 1, "Netcdf4 file not found when searching at %s" % search_path
+            
+            # With mfdataset, we can add extra datasets by using assign
+            try:                  
+                xtrds = xr.open_mfdataset(tmpnc_files, 
+                    data_vars=None, 
+                    coords='all', 
+                    compat='override',
+                    combine='by_coords' 
                 )
+                self.NetcdfDataset = xr.combine_by_coords(
+                    data_objects = [self.NetcdfDataset, xtrds],
+                    data_vars = 'all',
+                    compat='override',
+                    coords = "all", 
+                    join = 'override'
+                )
+                
             except Exception as e:
                 print(e)
                 raise PCSEError("An error occurred while opening file " + tmpnc_files[0])
-            ncda = ncds.data_vars[varname]
+
+            ncda = self.NetcdfDataset[varname]
             series = ncda[:, i, k].to_series()
             assert len(series) == self._timesteps, "Time steps for variable %s are not right!" % varname
             vap_values = vap_from_sh(series.values, self.elevation)
@@ -382,7 +446,11 @@ class NetcdfWeatherDataProvider(WeatherDataProvider, ge.GridEnvelope2D):
         Returns None if the cache file does not exist, else it returns the full path
         to the cache file.
         """
+        # Initialise
         result = None
+        eps = 0.001
+        
+        # Get hold of the cache file now
         cache_filename = self._get_cache_filename(cache_fname)
         if os.path.exists(cache_filename):
             cache_date = os.stat(cache_filename).st_mtime
@@ -394,19 +462,28 @@ class NetcdfWeatherDataProvider(WeatherDataProvider, ge.GridEnvelope2D):
                 search_path = os.path.dirname(self.__fp_txt_fname)
                 with open(self.__fp_txt_fname, 'r') as f:
                     newer_file_found = False
-                    for fname in f:
-                        nc_file = os.path.join(search_path, fname.strip())
-                        if os.path.exists(nc_file):
-                            nc_date = os.stat(nc_file).st_mtime
-                            if cache_date < nc_date:
-                                # cache is less recent than NetCDF file
-                                newer_file_found = True
-                                break
-                        else:
-                            raise IOError("File %s was not found!" % fname)
+                    other_coords_found = False
+                    
+                    # Get the first line
+                    firstline = f.readline().strip('\n')
+                    latlon = [float(coord) for coord in firstline.split(",")]
+                    if (abs(latlon[0] - self._lon) > eps) or (abs(latlon[1] - self._lat) > eps):
+                        other_coords_found = True
+                    else:
+                        # Continue wit the rest of the file    
+                        for fname in f:
+                            nc_file = os.path.join(search_path, fname.strip())
+                            if os.path.exists(nc_file):
+                                nc_date = os.stat(nc_file).st_mtime
+                                if cache_date < nc_date:
+                                    # cache is less recent than NetCDF file
+                                    newer_file_found = True
+                                    break
+                            else:
+                                raise IOError("File %s was not found!" % fname)
                     
                     # Okay, we looped over all the NetCDF files
-                    if not newer_file_found:
+                    if (not newer_file_found) or (not other_coords_found):
                         result = cache_filename
         finally:
             return result
